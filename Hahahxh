@@ -1,0 +1,1235 @@
+-- language: Luau, file: CCHub.client.lua, runtime: Roblox executor
+-- v21: Old Throw actually executes https://pastefy.app/GyghlYOG/raw on toggle-on.
+-- Anti Fling now snaps character back on sudden teleports + fixes tipped orientation.
+-- Old Throw fallback: Retargeting Disabled if loadstring fails.
+
+local Players          = game:GetService("Players")
+local TweenService     = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local RunService       = game:GetService("RunService")
+local Workspace        = game:GetService("Workspace")
+local Camera           = Workspace.CurrentCamera
+local HttpService      = game:GetService("HttpService")
+
+local player    = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+local CONFIG_FILE = "cchub_config.json"
+local hasFS = (type(writefile) == "function")
+          and (type(readfile)  == "function")
+          and (type(isfile)    == "function")
+
+local state = {
+    noReload = false, gunDraw = true, oldAnim = false, oldThrow = false,
+    shiftLock = false, antiFling = false,
+    gearHub = false, gravActive = false, dualGravActive = false, speedActive = false,
+    gravityGear = nil, dualGravityGear = nil, speedGear = nil, dualPreset = 1,
+    gunRotation = false,
+    espOn = false, espBox = true, espName = true, espRole = true, espDistance = true,
+    espTracer = false, espChams = false,
+    espShowMurderer = true, espShowSheriff = true, espShowInnocent = false,
+}
+
+if hasFS then
+    pcall(function()
+        if isfile(CONFIG_FILE) then
+            local decoded = HttpService:JSONDecode(readfile(CONFIG_FILE))
+            if type(decoded) == "table" then
+                for k, v in pairs(decoded) do state[k] = v end
+            end
+        end
+    end)
+end
+
+local function saveState()
+    if not hasFS then return end
+    pcall(function() writefile(CONFIG_FILE, HttpService:JSONEncode(state)) end)
+end
+
+local activeChar = player.Character
+local activeHum  = activeChar and activeChar:FindFirstChildOfClass("Humanoid")
+local function setCharacter(c) activeChar = c; activeHum = c:WaitForChild("Humanoid") end
+
+-- ============================================================
+-- SLOT MATCHING
+-- ============================================================
+local function slotMismatch(gearName, forSlot)
+    if not gearName then return false end
+    local n = gearName:lower()
+    local hasSpeedId   = n:find("99119158", 1, true) ~= nil
+    local hasGravityId = n:find("16688968", 1, true) ~= nil
+    local saysSpeed    = n:find("speed",   1, true) ~= nil
+    local saysGravity  = n:find("gravity", 1, true) ~= nil
+    local saysDual     = n:find("dual",    1, true) ~= nil
+
+    if forSlot == "single" then
+        if hasSpeedId or saysSpeed then return true end
+        if saysDual then return true end
+        return false
+    elseif forSlot == "dual" then
+        if hasSpeedId or saysSpeed then return true end
+        return false
+    elseif forSlot == "speed" then
+        if hasGravityId or saysGravity then return true end
+        if saysDual then return true end
+        return false
+    end
+    return false
+end
+
+-- ============================================================
+-- ANTI FLING
+-- ============================================================
+-- Three layers:
+--   1. Destroy any force/constraint instance the moment it appears on the character
+--   2. Clamp linear + angular velocity every frame
+--   3. Snap character back to last safe position if a teleport-like delta appears
+-- Also unsticks orientation if the character is tipped (fling tip-and-launch vector)
+local antiFlingConn        = nil
+local antiFlingHeartbeat   = nil
+local antiFlingPlayerConns = {}
+local lastSafePos          = nil
+local tippedFrames         = 0
+
+local function isDangerousInstance(inst)
+    return inst:IsA("BodyMover")
+        or inst:IsA("VectorForce")
+        or inst:IsA("Torque")
+        or inst:IsA("AngularVelocity")
+        or inst:IsA("LinearVelocity")
+        or inst:IsA("AlignPosition")
+        or inst:IsA("AlignOrientation")
+end
+
+local function nuke(container)
+    for _, d in ipairs(container:GetDescendants()) do
+        if isDangerousInstance(d) then
+            pcall(function() d:Destroy() end)
+        end
+    end
+end
+
+local function installAntiFling(character)
+    if antiFlingConn then pcall(function() antiFlingConn:Disconnect() end) end
+    lastSafePos = nil
+    tippedFrames = 0
+
+    nuke(character)
+
+    antiFlingConn = character.DescendantAdded:Connect(function(desc)
+        if isDangerousInstance(desc) then
+            pcall(function() desc:Destroy() end)
+        end
+    end)
+
+    if not antiFlingHeartbeat then
+        antiFlingHeartbeat = RunService.Heartbeat:Connect(function()
+            if not state.antiFling then return end
+            local char = activeChar
+            if not char then return end
+            local root = char:FindFirstChild("HumanoidRootPart")
+            if not root then return end
+
+            -- Layer 2: velocity clamps
+            local v = root.AssemblyLinearVelocity
+            if v.Magnitude > 200 then
+                root.AssemblyLinearVelocity = v.Unit * 200
+            end
+            local av = root.AssemblyAngularVelocity
+            if av.Magnitude > 15 then
+                root.AssemblyAngularVelocity = av.Unit * 15
+            end
+
+            -- Layer 3a: position snap-back on sudden teleport
+            local pos = root.Position
+            if lastSafePos then
+                local delta = (pos - lastSafePos).Magnitude
+                -- 30 studs in one frame at 60fps = 1800 studs/s. Legit movement + kicks are far below.
+                if delta > 30 then
+                    root.CFrame = CFrame.new(lastSafePos)
+                    root.AssemblyLinearVelocity = Vector3.zero
+                    root.AssemblyAngularVelocity = Vector3.zero
+                else
+                    lastSafePos = pos
+                end
+            else
+                lastSafePos = pos
+            end
+
+            -- Layer 3b: orientation rescue if heavily tipped for several frames
+            local upY = root.CFrame.UpVector.Y
+            if upY < 0.3 then
+                tippedFrames = tippedFrames + 1
+                if tippedFrames > 5 then
+                    local look = root.CFrame.LookVector
+                    look = Vector3.new(look.X, 0, look.Z)
+                    if look.Magnitude < 0.1 then look = Vector3.new(0, 0, -1) end
+                    look = look.Unit
+                    root.CFrame = CFrame.lookAt(root.Position, root.Position + look)
+                    tippedFrames = 0
+                end
+            else
+                tippedFrames = 0
+            end
+        end)
+    end
+end
+
+local function startAntiFling()
+    if activeChar then installAntiFling(activeChar) end
+    table.insert(antiFlingPlayerConns, player.CharacterAdded:Connect(installAntiFling))
+end
+
+local function stopAntiFling()
+    if antiFlingConn then pcall(function() antiFlingConn:Disconnect() end); antiFlingConn = nil end
+    if antiFlingHeartbeat then pcall(function() antiFlingHeartbeat:Disconnect() end); antiFlingHeartbeat = nil end
+    for _, c in ipairs(antiFlingPlayerConns) do pcall(function() c:Disconnect() end) end
+    antiFlingPlayerConns = {}
+    lastSafePos = nil
+    tippedFrames = 0
+end
+
+-- ============================================================
+-- OLD THROW (executes the pastefy script from your menu)
+-- ============================================================
+local function startOldThrow()
+    -- Primary: run the actual throw-old script from the menu
+    local ran = pcall(function()
+        loadstring(game:HttpGet("https://pastefy.app/GyghlYOG/raw", true))()
+    end)
+    -- Fallback: if loadstring or network fails, apply the Retargeting flip
+    if not ran then
+        pcall(function()
+            Workspace.Retargeting = Enum.AnimatorRetargetingMode.Disabled
+        end)
+    end
+end
+
+local function stopOldThrow()
+    -- We can't reliably undo arbitrary scripts, but Retargeting is the common lever
+    if not state.oldAnim then
+        pcall(function()
+            Workspace.Retargeting = Enum.AnimatorRetargetingMode.Default
+        end)
+    end
+end
+
+-- ============================================================
+-- WEAPON ROTATOR
+-- ============================================================
+local weaponRotator = nil
+local weaponRotatorConns = {}
+
+local function startWeaponRotator()
+    if weaponRotator then return end
+    local CONFIG = {
+        DefaultStrength = 1, MinStrength = 1, MaxStrength = 5,
+        FileName    = "WeaponRotationConfigs.json",
+        AnglesFile  = "WeaponRotatorAngles.json",
+        BackgroundColor  = Color3.fromRGB(30, 30, 35),
+        HeaderColor      = Color3.fromRGB(20, 20, 25),
+        TabActiveColor   = Color3.fromRGB(0, 120, 215),
+        TabInactiveColor = Color3.fromRGB(45, 45, 55),
+        ButtonColor      = Color3.fromRGB(50, 50, 60),
+        ActiveButtonColor= Color3.fromRGB(0, 120, 215),
+        GreenAccentColor = Color3.fromRGB(46, 204, 113),
+        RedAccentColor   = Color3.fromRGB(231, 76, 60),
+        TextColor        = Color3.fromRGB(255, 255, 255),
+        CornerRadius     = 10,
+    }
+    local currentStrengthLevel = CONFIG.DefaultStrength
+    local perToolAngles, savedConfigs, strengthButtons = {}, {}, {}
+    local refreshConfigsList
+    local isFileSupported = (type(writefile) == "function") and (type(readfile) == "function")
+
+    local function loadAnglesFromFile()
+        if not isFileSupported then return end
+        local okE, exists = pcall(function() return isfile and isfile(CONFIG.AnglesFile) end)
+        if okE and exists then
+            local okR, content = pcall(function() return readfile(CONFIG.AnglesFile) end)
+            if okR and content and #content > 0 then
+                local okD, decoded = pcall(function() return HttpService:JSONDecode(content) end)
+                if okD and type(decoded) == "table" then perToolAngles = decoded end
+            end
+        end
+    end
+    local function saveAnglesToFile()
+        if not isFileSupported then return end
+        pcall(function() writefile(CONFIG.AnglesFile, HttpService:JSONEncode(perToolAngles)) end)
+    end
+    loadAnglesFromFile()
+
+    local function getStoredAngle(toolName) return perToolAngles[toolName] or 0 end
+    local function storeAngle(toolName, angle)
+        if angle == nil or angle == 0 then perToolAngles[toolName] = nil
+        else perToolAngles[toolName] = angle end
+        saveAnglesToFile()
+    end
+
+    local function loadConfigsFromFile()
+        if not isFileSupported then return end
+        local okE, exists = pcall(function() return isfile and isfile(CONFIG.FileName) end)
+        if okE and exists then
+            local okR, content = pcall(function() return readfile(CONFIG.FileName) end)
+            if okR and content and #content > 0 then
+                local okD, decoded = pcall(function() return HttpService:JSONDecode(content) end)
+                if okD and type(decoded) == "table" then savedConfigs = decoded end
+            end
+        end
+    end
+    local function saveConfigsToFile()
+        if not isFileSupported then return end
+        pcall(function() writefile(CONFIG.FileName, HttpService:JSONEncode(savedConfigs)) end)
+    end
+    loadConfigsFromFile()
+
+    local function getEquippedTool()
+        local c = player.Character; if not c then return nil end
+        return c:FindFirstChildOfClass("Tool")
+    end
+    local function applyToolGrip(tool)
+        if not tool then return end
+        if not tool:GetAttribute("DefaultGrip") then
+            tool:SetAttribute("DefaultGrip", tool.Grip)
+        end
+        local angle = getStoredAngle(tool.Name)
+        tool.Grip = tool:GetAttribute("DefaultGrip") * CFrame.Angles(0, math.rad(angle), 0)
+    end
+    local function rotateWeapon(dir)
+        local t = getEquippedTool(); if not t then return end
+        local newAngle = getStoredAngle(t.Name) + (dir * currentStrengthLevel)
+        storeAngle(t.Name, newAngle)
+        applyToolGrip(t)
+    end
+    local function resetRotation()
+        local t = getEquippedTool(); if not t then return end
+        storeAngle(t.Name, 0)
+        applyToolGrip(t)
+    end
+
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "WeaponRotationGui"; screenGui.ResetOnSpawn = false
+    screenGui.DisplayOrder = 1000; screenGui.Parent = playerGui
+
+    local mainFrame = Instance.new("Frame")
+    mainFrame.Size = UDim2.new(0, 380, 0, 190)
+    mainFrame.Position = UDim2.new(0.5, -190, 0.5, -95)
+    mainFrame.BackgroundColor3 = CONFIG.BackgroundColor
+    mainFrame.BorderSizePixel = 0; mainFrame.Active = true
+    mainFrame.Parent = screenGui
+    Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, CONFIG.CornerRadius)
+
+    local function makeDraggable(obj)
+        local dragging, dragStart, startPos
+        table.insert(weaponRotatorConns, obj.InputBegan:Connect(function(i)
+            if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+                dragging = true; dragStart = i.Position; startPos = obj.Position
+            end
+        end))
+        table.insert(weaponRotatorConns, obj.InputEnded:Connect(function(i)
+            if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+                dragging = false
+            end
+        end))
+        table.insert(weaponRotatorConns, UserInputService.InputChanged:Connect(function(i)
+            if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+                local d = i.Position - dragStart
+                obj.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+            end
+        end))
+    end
+    makeDraggable(mainFrame)
+
+    local miniBar = Instance.new("Frame")
+    miniBar.Size = UDim2.new(0, 220, 0, 34)
+    miniBar.Position = mainFrame.Position
+    miniBar.BackgroundColor3 = CONFIG.HeaderColor
+    miniBar.BorderSizePixel = 0; miniBar.Active = true; miniBar.Visible = false
+    miniBar.Parent = screenGui
+    local mbCorner = Instance.new("UICorner"); mbCorner.CornerRadius = UDim.new(0, CONFIG.CornerRadius); mbCorner.Parent = miniBar
+    local mbStroke = Instance.new("UIStroke"); mbStroke.Color = CONFIG.GreenAccentColor; mbStroke.Thickness = 1.5; mbStroke.Transparency = 0.4; mbStroke.Parent = miniBar
+
+    local miniTitle = Instance.new("TextLabel")
+    miniTitle.Size = UDim2.new(1, -50, 1, 0); miniTitle.Position = UDim2.new(0, 12, 0, 0)
+    miniTitle.BackgroundTransparency = 1; miniTitle.Text = "Weapon Rotator"
+    miniTitle.TextColor3 = CONFIG.TextColor; miniTitle.Font = Enum.Font.SourceSansBold
+    miniTitle.TextSize = 14; miniTitle.TextXAlignment = Enum.TextXAlignment.Left
+    miniTitle.Parent = miniBar
+
+    local miniExpandBtn = Instance.new("TextButton")
+    miniExpandBtn.Size = UDim2.new(0, 28, 0, 24); miniExpandBtn.Position = UDim2.new(1, -34, 0.5, -12)
+    miniExpandBtn.BackgroundColor3 = CONFIG.GreenAccentColor; miniExpandBtn.TextColor3 = CONFIG.TextColor
+    miniExpandBtn.Text = "+"; miniExpandBtn.Font = Enum.Font.SourceSansBold; miniExpandBtn.TextSize = 20
+    miniExpandBtn.Parent = miniBar
+    local mebCorner = Instance.new("UICorner"); mebCorner.CornerRadius = UDim.new(0, 6); mebCorner.Parent = miniExpandBtn
+    makeDraggable(miniBar)
+
+    local headerBar = Instance.new("Frame")
+    headerBar.Size = UDim2.new(1, 0, 0, 28); headerBar.BackgroundColor3 = CONFIG.HeaderColor
+    headerBar.BorderSizePixel = 0; headerBar.Parent = mainFrame
+    local hc = Instance.new("UICorner"); hc.CornerRadius = UDim.new(0, CONFIG.CornerRadius); hc.Parent = headerBar
+
+    local titleLbl = Instance.new("TextLabel")
+    titleLbl.Size = UDim2.new(1, -40, 1, 0); titleLbl.Position = UDim2.new(0, 10, 0, 0)
+    titleLbl.BackgroundTransparency = 1; titleLbl.Text = "Weapon Rotator"
+    titleLbl.TextColor3 = CONFIG.TextColor; titleLbl.Font = Enum.Font.SourceSansBold
+    titleLbl.TextSize = 14; titleLbl.TextXAlignment = Enum.TextXAlignment.Left
+    titleLbl.Parent = headerBar
+
+    local minimizeBtn = Instance.new("TextButton")
+    minimizeBtn.Size = UDim2.new(0, 24, 0, 22); minimizeBtn.Position = UDim2.new(1, -28, 0, 3)
+    minimizeBtn.BackgroundColor3 = CONFIG.ButtonColor; minimizeBtn.TextColor3 = CONFIG.TextColor
+    minimizeBtn.Text = "-"; minimizeBtn.Font = Enum.Font.SourceSansBold; minimizeBtn.TextSize = 20
+    minimizeBtn.Parent = headerBar
+    local mc = Instance.new("UICorner"); mc.CornerRadius = UDim.new(0, 4); mc.Parent = minimizeBtn
+
+    table.insert(weaponRotatorConns, minimizeBtn.Activated:Connect(function()
+        mainFrame.Visible = false; miniBar.Position = mainFrame.Position; miniBar.Visible = true
+    end))
+    table.insert(weaponRotatorConns, miniExpandBtn.Activated:Connect(function()
+        miniBar.Visible = false; mainFrame.Position = miniBar.Position; mainFrame.Visible = true
+    end))
+
+    local tabRow = Instance.new("Frame")
+    tabRow.Size = UDim2.new(1, -16, 0, 26); tabRow.Position = UDim2.new(0, 8, 0, 34)
+    tabRow.BackgroundTransparency = 1; tabRow.Parent = mainFrame
+
+    local tabRotatorBtn = Instance.new("TextButton")
+    tabRotatorBtn.Size = UDim2.new(0.5, -4, 1, 0); tabRotatorBtn.BackgroundColor3 = CONFIG.TabActiveColor
+    tabRotatorBtn.TextColor3 = CONFIG.TextColor; tabRotatorBtn.Text = "Rotator"
+    tabRotatorBtn.Font = Enum.Font.SourceSansBold; tabRotatorBtn.TextSize = 13
+    tabRotatorBtn.Parent = tabRow
+    local trc = Instance.new("UICorner"); trc.CornerRadius = UDim.new(0, 6); trc.Parent = tabRotatorBtn
+
+    local tabConfigsBtn = Instance.new("TextButton")
+    tabConfigsBtn.Size = UDim2.new(0.5, -4, 1, 0); tabConfigsBtn.Position = UDim2.new(0.5, 4, 0, 0)
+    tabConfigsBtn.BackgroundColor3 = CONFIG.TabInactiveColor; tabConfigsBtn.TextColor3 = CONFIG.TextColor
+    tabConfigsBtn.Text = "Configs"; tabConfigsBtn.Font = Enum.Font.SourceSansBold
+    tabConfigsBtn.TextSize = 13; tabConfigsBtn.Parent = tabRow
+    local tcc = Instance.new("UICorner"); tcc.CornerRadius = UDim.new(0, 6); tcc.Parent = tabConfigsBtn
+
+    local rotatorPanel = Instance.new("Frame")
+    rotatorPanel.Size = UDim2.new(1, 0, 0, 115); rotatorPanel.Position = UDim2.new(0, 0, 0, 66)
+    rotatorPanel.BackgroundTransparency = 1; rotatorPanel.Visible = true; rotatorPanel.Parent = mainFrame
+    local configsPanel = Instance.new("Frame")
+    configsPanel.Size = UDim2.new(1, 0, 0, 115); configsPanel.Position = UDim2.new(0, 0, 0, 66)
+    configsPanel.BackgroundTransparency = 1; configsPanel.Visible = false; configsPanel.Parent = mainFrame
+    table.insert(weaponRotatorConns, tabRotatorBtn.Activated:Connect(function()
+        tabRotatorBtn.BackgroundColor3 = CONFIG.TabActiveColor; tabConfigsBtn.BackgroundColor3 = CONFIG.TabInactiveColor
+        rotatorPanel.Visible = true; configsPanel.Visible = false
+    end))
+    table.insert(weaponRotatorConns, tabConfigsBtn.Activated:Connect(function()
+        tabConfigsBtn.BackgroundColor3 = CONFIG.TabActiveColor; tabRotatorBtn.BackgroundColor3 = CONFIG.TabInactiveColor
+        configsPanel.Visible = true; rotatorPanel.Visible = false
+    end))
+
+    local row1 = Instance.new("Frame")
+    row1.Size = UDim2.new(1, 0, 0, 34); row1.Position = UDim2.new(0, 0, 0, 10)
+    row1.BackgroundTransparency = 1; row1.Parent = rotatorPanel
+    local l1 = Instance.new("UIListLayout"); l1.FillDirection = Enum.FillDirection.Horizontal
+    l1.HorizontalAlignment = Enum.HorizontalAlignment.Center; l1.Padding = UDim.new(0, 8); l1.Parent = row1
+
+    local row2 = Instance.new("Frame")
+    row2.Size = UDim2.new(1, 0, 0, 30); row2.Position = UDim2.new(0, 0, 0, 52)
+    row2.BackgroundTransparency = 1; row2.Parent = rotatorPanel
+    local l2 = Instance.new("UIListLayout"); l2.FillDirection = Enum.FillDirection.Horizontal
+    l2.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    l2.VerticalAlignment = Enum.VerticalAlignment.Center; l2.Padding = UDim.new(0, 6); l2.Parent = row2
+
+    local function createButton(parent, text, width, color, onClick)
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(0, width, 0, 28)
+        btn.BackgroundColor3 = color or CONFIG.ButtonColor; btn.TextColor3 = CONFIG.TextColor
+        btn.Text = text; btn.Font = Enum.Font.SourceSansBold; btn.TextSize = 14
+        btn.Parent = parent
+        local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 6); c.Parent = btn
+        table.insert(weaponRotatorConns, btn.Activated:Connect(onClick))
+        return btn
+    end
+
+    createButton(row1, "◀ Left", 80, CONFIG.ButtonColor, function() rotateWeapon(-1) end)
+    createButton(row1, "Reset", 65, CONFIG.ButtonColor, resetRotation)
+    createButton(row1, "Right ▶", 80, CONFIG.ButtonColor, function() rotateWeapon(1) end)
+
+    local pwrLbl = Instance.new("TextLabel")
+    pwrLbl.Size = UDim2.new(0, 60, 0, 28); pwrLbl.BackgroundTransparency = 1
+    pwrLbl.Text = "Strength:"; pwrLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
+    pwrLbl.Font = Enum.Font.SourceSansBold; pwrLbl.TextSize = 13; pwrLbl.Parent = row2
+
+    local function selectStrength(lvl)
+        currentStrengthLevel = lvl
+        for level, b in pairs(strengthButtons) do
+            b.BackgroundColor3 = (level == lvl) and CONFIG.ActiveButtonColor or CONFIG.ButtonColor
+        end
+    end
+    for i = CONFIG.MinStrength, CONFIG.MaxStrength do
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(0, 30, 0, 26)
+        btn.BackgroundColor3 = (i == CONFIG.DefaultStrength) and CONFIG.ActiveButtonColor or CONFIG.ButtonColor
+        btn.TextColor3 = CONFIG.TextColor; btn.Text = tostring(i)
+        btn.Font = Enum.Font.SourceSansBold; btn.TextSize = 14; btn.Parent = row2
+        local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 5); c.Parent = btn
+        strengthButtons[i] = btn
+        table.insert(weaponRotatorConns, btn.Activated:Connect(function() selectStrength(i) end))
+    end
+
+    local configInput = Instance.new("TextBox")
+    configInput.Size = UDim2.new(0, 220, 0, 28); configInput.Position = UDim2.new(0, 12, 0, 8)
+    configInput.BackgroundColor3 = Color3.fromRGB(45, 45, 55); configInput.TextColor3 = CONFIG.TextColor
+    configInput.PlaceholderText = "Enter config name..."; configInput.PlaceholderColor3 = Color3.fromRGB(150, 150, 150)
+    configInput.Text = ""; configInput.Font = Enum.Font.SourceSans; configInput.TextSize = 13
+    configInput.Parent = configsPanel
+    local ci = Instance.new("UICorner"); ci.CornerRadius = UDim.new(0, 6); ci.Parent = configInput
+
+    local saveBtn = createButton(configsPanel, "Save", 120, CONFIG.GreenAccentColor, function()
+        local t = getEquippedTool(); local name = configInput.Text
+        if name == "" then name = (t and t.Name or "Preset") .. "_" .. math.random(100, 999) end
+        savedConfigs[name] = t and getStoredAngle(t.Name) or 0
+        configInput.Text = ""
+        saveConfigsToFile(); refreshConfigsList()
+    end)
+    saveBtn.Position = UDim2.new(1, -132, 0, 8)
+
+    local scrollFrame = Instance.new("ScrollingFrame")
+    scrollFrame.Size = UDim2.new(1, -24, 0, 68); scrollFrame.Position = UDim2.new(0, 12, 0, 44)
+    scrollFrame.BackgroundTransparency = 1; scrollFrame.BorderSizePixel = 0
+    scrollFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+    scrollFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    scrollFrame.ScrollBarThickness = 6; scrollFrame.Parent = configsPanel
+    local ll2 = Instance.new("UIListLayout"); ll2.FillDirection = Enum.FillDirection.Vertical
+    ll2.HorizontalAlignment = Enum.HorizontalAlignment.Center; ll2.Padding = UDim.new(0, 4); ll2.Parent = scrollFrame
+
+    refreshConfigsList = function()
+        for _, child in pairs(scrollFrame:GetChildren()) do
+            if child:IsA("Frame") then child:Destroy() end
+        end
+        for configName, angle in pairs(savedConfigs) do
+            local itemRow = Instance.new("Frame")
+            itemRow.Size = UDim2.new(1, -6, 0, 26); itemRow.BackgroundTransparency = 1; itemRow.Parent = scrollFrame
+            local loadBtn = Instance.new("TextButton")
+            loadBtn.Size = UDim2.new(1, -32, 1, 0); loadBtn.BackgroundColor3 = CONFIG.ButtonColor
+            loadBtn.TextColor3 = CONFIG.TextColor
+            loadBtn.Text = configName .. " (" .. math.floor(angle) .. "°)"
+            loadBtn.Font = Enum.Font.SourceSansBold; loadBtn.TextSize = 13
+            loadBtn.TextXAlignment = Enum.TextXAlignment.Left; loadBtn.Parent = itemRow
+            local lb = Instance.new("UICorner"); lb.CornerRadius = UDim.new(0, 4); lb.Parent = loadBtn
+            table.insert(weaponRotatorConns, loadBtn.Activated:Connect(function()
+                local t = getEquippedTool()
+                if t then storeAngle(t.Name, angle); applyToolGrip(t) end
+            end))
+            local delBtn = Instance.new("TextButton")
+            delBtn.Size = UDim2.new(0, 26, 1, 0); delBtn.Position = UDim2.new(1, -28, 0, 0)
+            delBtn.BackgroundColor3 = CONFIG.RedAccentColor; delBtn.TextColor3 = CONFIG.TextColor
+            delBtn.Text = "X"; delBtn.Font = Enum.Font.SourceSansBold; delBtn.TextSize = 13
+            delBtn.Parent = itemRow
+            local db = Instance.new("UICorner"); db.CornerRadius = UDim.new(0, 4); db.Parent = delBtn
+            table.insert(weaponRotatorConns, delBtn.Activated:Connect(function()
+                savedConfigs[configName] = nil; saveConfigsToFile(); refreshConfigsList()
+            end))
+        end
+    end
+    refreshConfigsList()
+
+    local function connectChar(c)
+        table.insert(weaponRotatorConns, c.ChildAdded:Connect(function(child)
+            if child:IsA("Tool") then applyToolGrip(child) end
+        end))
+    end
+    if player.Character then
+        connectChar(player.Character)
+        local t = player.Character:FindFirstChildOfClass("Tool")
+        if t then applyToolGrip(t) end
+    end
+    table.insert(weaponRotatorConns, player.CharacterAdded:Connect(connectChar))
+
+    weaponRotator = { gui = screenGui }
+end
+
+local function stopWeaponRotator()
+    for _, c in ipairs(weaponRotatorConns) do pcall(function() c:Disconnect() end) end
+    weaponRotatorConns = {}
+    if weaponRotator and weaponRotator.gui then pcall(function() weaponRotator.gui:Destroy() end) end
+    weaponRotator = nil
+end
+
+-- ============================================================
+-- NO RELOAD
+-- ============================================================
+local noReloadConns = {}
+local function applyNoReload(character)
+    local hum = character:WaitForChild("Humanoid", 5); if not hum then return end
+    local animator = hum:WaitForChild("Animator", 5); if not animator then return end
+    table.insert(noReloadConns, animator.AnimationPlayed:Connect(function(track)
+        if track.Priority == Enum.AnimationPriority.Action then track:Stop() end
+    end))
+end
+local function startNoReload()
+    if activeChar then applyNoReload(activeChar) end
+    table.insert(noReloadConns, player.CharacterAdded:Connect(applyNoReload))
+end
+local function stopNoReload()
+    for _, c in ipairs(noReloadConns) do c:Disconnect() end
+    noReloadConns = {}
+end
+
+-- ============================================================
+-- GUN DRAW SOUND
+-- ============================================================
+local gunSound = Instance.new("Sound")
+gunSound.SoundId = "rbxassetid://6968135315"
+gunSound.Volume = 0.5; gunSound.Parent = Workspace
+local gunConns, gunBackpackConn = {}, nil
+
+local function isGunTool(tool)
+    local n = tool.Name:lower()
+    for _, w in ipairs({"knife","bomb","sword","blade","dagger","axe","hammer","bat","crowbar","pipe","wrench"}) do
+        if n:find(w) then return false end
+    end
+    for _, w in ipairs({"gun","scope","laser","pistol","revolver","rifle","shotgun","blaster","ray","plasma"}) do
+        if n:find(w) then return true end
+    end
+    return false
+end
+local function setupGunTool(tool)
+    if not tool:IsA("Tool") or not isGunTool(tool) then return end
+    table.insert(gunConns, tool.Equipped:Connect(function() if state.gunDraw then gunSound:Play() end end))
+    table.insert(gunConns, tool.Unequipped:Connect(function() if state.gunDraw then gunSound:Play() end end))
+end
+local function hookGunChar(c)
+    for _, x in ipairs(c:GetChildren()) do setupGunTool(x) end
+    table.insert(gunConns, c.ChildAdded:Connect(function(x) setupGunTool(x) end))
+end
+local function startGunDraw()
+    if activeChar then hookGunChar(activeChar) end
+    table.insert(gunConns, player.CharacterAdded:Connect(hookGunChar))
+    if not gunBackpackConn then
+        gunBackpackConn = player.Backpack.ChildAdded:Connect(function(t) setupGunTool(t) end)
+    end
+end
+local function stopGunDraw()
+    for _, c in ipairs(gunConns) do c:Disconnect() end
+    gunConns = {}
+    if gunBackpackConn then gunBackpackConn:Disconnect(); gunBackpackConn = nil end
+end
+
+-- ============================================================
+-- OLD ANIMATION
+-- ============================================================
+local function startOldAnim() Workspace.Retargeting = Enum.AnimatorRetargetingMode.Disabled end
+local function stopOldAnim()
+    if not state.oldThrow then
+        Workspace.Retargeting = Enum.AnimatorRetargetingMode.Default
+    end
+end
+
+-- ============================================================
+-- SHIFT LOCK
+-- ============================================================
+local SHIFT_OFFSET, NORMAL_OFFSET = Vector3.new(1.2, 0.8, 0), Vector3.new(0,0,0)
+local isShiftLocked = false
+RunService.RenderStepped:Connect(function()
+    if not activeHum or not state.shiftLock then return end
+    if UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter then
+        if not isShiftLocked then isShiftLocked = true; activeHum.CameraOffset = SHIFT_OFFSET end
+    else
+        if isShiftLocked then isShiftLocked = false; activeHum.CameraOffset = NORMAL_OFFSET end
+    end
+end)
+
+-- ============================================================
+-- GEAR HUB
+-- ============================================================
+local SPEED_MULTIPLIER = 2.0
+local DUAL_PRESETS = {
+    [1] = { negation = 0.85, kick = 65, label = "① Current"     },
+    [2] = { negation = 1.35, kick = 78, label = "② Upward Bias" },
+}
+local SLOTS = {
+    single = {
+        stateKey = "gravActive", gearKey = "gravityGear",
+        negation = 0.85, kick = 45,
+        rig = { attachment = nil, force = nil, wasOnGround = true },
+    },
+    dual = {
+        stateKey = "dualGravActive", gearKey = "dualGravityGear",
+        negation = DUAL_PRESETS[state.dualPreset or 1].negation,
+        kick     = DUAL_PRESETS[state.dualPreset or 1].kick,
+        rig = { attachment = nil, force = nil, wasOnGround = true },
+    },
+}
+local function applyDualPreset(idx)
+    idx = DUAL_PRESETS[idx] and idx or 1
+    state.dualPreset = idx
+    SLOTS.dual.negation = DUAL_PRESETS[idx].negation
+    SLOTS.dual.kick     = DUAL_PRESETS[idx].kick
+    saveState()
+end
+
+local chosenGravity     = state.gravityGear
+local chosenDualGravity = state.dualGravityGear
+local chosenSpeed       = state.speedGear
+
+if chosenDualGravity == chosenGravity then chosenDualGravity = nil; state.dualGravityGear = nil end
+if chosenSpeed == chosenGravity or chosenSpeed == chosenDualGravity then chosenSpeed = nil; state.speedGear = nil end
+if chosenGravity     and slotMismatch(chosenGravity, "single")     then chosenGravity = nil;     state.gravityGear = nil end
+if chosenDualGravity and slotMismatch(chosenDualGravity, "dual")   then chosenDualGravity = nil; state.dualGravityGear = nil end
+if chosenSpeed       and slotMismatch(chosenSpeed, "speed")        then chosenSpeed = nil;       state.speedGear = nil end
+saveState()
+
+local function nameInOtherSlot(name, exceptSlot)
+    if not name then return false end
+    if exceptSlot ~= "single" and chosenGravity     == name then return true end
+    if exceptSlot ~= "dual"   and chosenDualGravity == name then return true end
+    if exceptSlot ~= "speed"  and chosenSpeed       == name then return true end
+    return false
+end
+
+local captureMode = nil
+local refreshUI
+
+local function isEquipped(name)
+    if not activeChar or not name then return false end
+    for _, t in ipairs(activeChar:GetChildren()) do
+        if t:IsA("Tool") and t.Name == name then return true end
+    end
+    return false
+end
+local function chosenFor(sn)
+    if sn == "single" then return chosenGravity end
+    if sn == "dual"   then return chosenDualGravity end
+end
+local function buildRig(rig, root)
+    if rig.force then rig.force:Destroy() end
+    if rig.attachment then rig.attachment:Destroy() end
+    rig.attachment = Instance.new("Attachment"); rig.attachment.Parent = root
+    rig.force = Instance.new("VectorForce")
+    rig.force.Attachment0 = rig.attachment
+    rig.force.RelativeTo = Enum.ActuatorRelativeTo.World
+    rig.force.Force = Vector3.zero; rig.force.Enabled = false
+    rig.force.Parent = root
+end
+local function setupRigs()
+    if not activeChar then return end
+    local root = activeChar:FindFirstChild("HumanoidRootPart")
+    if not root then task.defer(setupRigs); return end
+    buildRig(SLOTS.single.rig, root)
+    buildRig(SLOTS.dual.rig, root)
+    SLOTS.single.rig.wasOnGround = true
+    SLOTS.dual.rig.wasOnGround = true
+end
+local function assemblyMass(root)
+    local total = root:GetMass()
+    local seen = { [root] = true }
+    local function gather(p)
+        for _, q in ipairs(p:GetConnectedParts()) do
+            if not seen[q] then seen[q] = true; total += q:GetMass(); gather(q) end
+        end
+    end
+    gather(root); return total
+end
+local function runGravitySlot(sn)
+    local slot = SLOTS[sn]; local rig = slot.rig
+    if not rig.force or not activeChar or not activeHum or activeHum.Health <= 0 then
+        if rig.force then rig.force.Enabled = false end
+        rig.wasOnGround = true; return
+    end
+    local gearName = chosenFor(sn)
+    local gearOn = state[slot.stateKey]
+        and isEquipped(gearName)
+        and not slotMismatch(gearName, sn)
+    if gearOn then
+        local root = activeChar:FindFirstChild("HumanoidRootPart")
+        if root then
+            rig.force.Force = Vector3.new(0, assemblyMass(root) * Workspace.Gravity * slot.negation, 0)
+            rig.force.Enabled = true
+        end
+    else
+        rig.force.Force = Vector3.zero; rig.force.Enabled = false
+    end
+    local onGround = activeHum.FloorMaterial ~= Enum.Material.Air
+    local root = activeChar:FindFirstChild("HumanoidRootPart")
+    if gearOn and rig.wasOnGround and not onGround and root then
+        local v = root.AssemblyLinearVelocity
+        root.AssemblyLinearVelocity = Vector3.new(v.X, slot.kick, v.Z)
+    end
+    rig.wasOnGround = onGround
+end
+RunService.Heartbeat:Connect(function()
+    if not state.gearHub then
+        if SLOTS.single.rig.force then SLOTS.single.rig.force.Enabled = false end
+        if SLOTS.dual.rig.force then SLOTS.dual.rig.force.Enabled = false end
+        return
+    end
+    runGravitySlot("single"); runGravitySlot("dual")
+end)
+RunService.Heartbeat:Connect(function()
+    if not state.gearHub or not activeChar or not activeHum or activeHum.Health <= 0 then return end
+    local on = state.speedActive
+        and isEquipped(chosenSpeed)
+        and not slotMismatch(chosenSpeed, "speed")
+    if on then
+        local md = activeHum.MoveDirection
+        activeHum.WalkSpeed = (md.Magnitude > 0) and (16 * SPEED_MULTIPLIER) or 16
+    else
+        if activeHum.WalkSpeed ~= 16 then activeHum.WalkSpeed = 16 end
+    end
+end)
+
+local charWatchers = {}
+local function clearWatchers() for _, c in ipairs(charWatchers) do c:Disconnect() end; charWatchers = {} end
+local function setupWatchers(character)
+    table.insert(charWatchers, character.ChildAdded:Connect(function(child)
+        if not captureMode or not child:IsA("Tool") then return end
+        local refused = false
+        if captureMode == "gravity" then
+            if nameInOtherSlot(child.Name, "single") or slotMismatch(child.Name, "single") then refused = true
+            else chosenGravity = child.Name; state.gravityGear = chosenGravity end
+        elseif captureMode == "dualGravity" then
+            if nameInOtherSlot(child.Name, "dual") or slotMismatch(child.Name, "dual") then refused = true
+            else chosenDualGravity = child.Name; state.dualGravityGear = chosenDualGravity end
+        elseif captureMode == "speed" then
+            if nameInOtherSlot(child.Name, "speed") or slotMismatch(child.Name, "speed") then refused = true
+            else chosenSpeed = child.Name; state.speedGear = chosenSpeed end
+        end
+        if refused then
+            if captureMode == "gravity" and gravGearBtnRef then
+                gravGearBtnRef.Text = chosenGravity and ("Gravity: " .. chosenGravity) or "Set Gravity Gear"
+            elseif captureMode == "dualGravity" and dualGearBtnRef then
+                dualGearBtnRef.Text = chosenDualGravity and ("Dual: " .. chosenDualGravity) or "Set Dual Gravity Gear"
+            elseif captureMode == "speed" and speedGearBtnRef then
+                speedGearBtnRef.Text = chosenSpeed and ("Speed: " .. chosenSpeed) or "Set Speed Gear"
+            end
+        end
+        saveState(); captureMode = nil
+        if refreshUI then refreshUI() end
+    end))
+    table.insert(charWatchers, character.ChildRemoved:Connect(function(child)
+        if not child:IsA("Tool") then return end
+        if child.Name == chosenGravity then runGravitySlot("single") end
+        if child.Name == chosenDualGravity then runGravitySlot("dual") end
+        if child.Name == chosenSpeed and activeHum then activeHum.WalkSpeed = 16 end
+    end))
+end
+
+player.CharacterAdded:Connect(function(c)
+    setCharacter(c); isShiftLocked = false
+    clearWatchers(); setupWatchers(c); task.defer(setupRigs)
+end)
+
+-- ============================================================
+-- ROLES ESP
+-- ============================================================
+local ROLE = {
+    murderer = { name = "Murderer", color = Color3.fromRGB(255, 60, 60) },
+    sheriff  = { name = "Sheriff",  color = Color3.fromRGB(80, 170, 255) },
+    innocent = { name = "Innocent", color = Color3.fromRGB(80, 220, 80) },
+    unknown  = { name = "Unknown",  color = Color3.fromRGB(200, 200, 200) },
+}
+local MURDERER_MARKERS, SHERIFF_MARKERS = { "knife" }, { "gun", "revolver", "luger", "colt" }
+local function nameMatches(n, markers)
+    local s = n:lower()
+    for _, m in ipairs(markers) do if s:find(m, 1, true) then return true end end
+    return false
+end
+local function classifyPlayer(plr)
+    if not plr then return "unknown" end
+    if plr.Character then
+        for _, item in ipairs(plr.Character:GetChildren()) do
+            if item:IsA("Tool") then
+                if nameMatches(item.Name, MURDERER_MARKERS) then return "murderer" end
+                if nameMatches(item.Name, SHERIFF_MARKERS) then return "sheriff" end
+            end
+        end
+    end
+    local bp = plr:FindFirstChild("Backpack")
+    if bp then
+        for _, item in ipairs(bp:GetChildren()) do
+            if item:IsA("Tool") then
+                if nameMatches(item.Name, MURDERER_MARKERS) then return "murderer" end
+                if nameMatches(item.Name, SHERIFF_MARKERS) then return "sheriff" end
+            end
+        end
+    end
+    return "innocent"
+end
+local function roleAllowed(rk)
+    if rk == "murderer" then return state.espShowMurderer end
+    if rk == "sheriff" then return state.espShowSheriff end
+    if rk == "innocent" then return state.espShowInnocent end
+    return true
+end
+
+local espGui = Instance.new("ScreenGui")
+espGui.Name = "CCHubESP"; espGui.ResetOnSpawn = false
+espGui.IgnoreGuiInset = true; espGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+espGui.DisplayOrder = 998; espGui.Parent = playerGui
+
+local espEntries = {}
+local function makeEntry(plr)
+    local bb = Instance.new("BillboardGui")
+    bb.Name = "CC_ESP_" .. plr.Name
+    bb.Size = UDim2.new(0, 200, 0, 60)
+    bb.StudsOffset = Vector3.new(0, 3, 0)
+    bb.AlwaysOnTop = false; bb.Parent = espGui
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, 0, 0, 20); lbl.BackgroundTransparency = 1
+    lbl.TextColor3 = Color3.new(1,1,1); lbl.TextStrokeTransparency = 0
+    lbl.Font = Enum.Font.GothamBold; lbl.TextSize = 14; lbl.Text = plr.Name; lbl.Parent = bb
+    local box = Instance.new("Frame")
+    box.Size = UDim2.new(1, 0, 0, 40); box.Position = UDim2.new(0, 0, 0, 20)
+    box.BackgroundTransparency = 1; box.Parent = bb
+    local function edge(sz, ps)
+        local f = Instance.new("Frame"); f.Size = sz; f.Position = ps
+        f.BackgroundColor3 = Color3.new(1,1,1); f.BorderSizePixel = 0; f.Parent = box; return f
+    end
+    local e1 = edge(UDim2.new(1, 0, 0, 1), UDim2.new(0, 0, 0, 0))
+    local e2 = edge(UDim2.new(1, 0, 0, 1), UDim2.new(0, 0, 1, -1))
+    local e3 = edge(UDim2.new(0, 1, 1, 0), UDim2.new(0, 0, 0, 0))
+    local e4 = edge(UDim2.new(0, 1, 1, 0), UDim2.new(1, -1, 0, 0))
+    local tr = Instance.new("Frame")
+    tr.BackgroundColor3 = Color3.new(1,1,1); tr.BorderSizePixel = 0
+    tr.ZIndex = 2; tr.Visible = false; tr.Parent = espGui
+    local hl = Instance.new("Highlight")
+    hl.FillTransparency = 0.6; hl.OutlineTransparency = 0.2
+    hl.Enabled = false; hl.Parent = espGui
+    return { billboard = bb, label = lbl, edges = {e1,e2,e3,e4}, tracer = tr, highlight = hl, role = "unknown" }
+end
+local function destroyEntry(entry)
+    if not entry then return end
+    if entry.billboard then entry.billboard:Destroy() end
+    if entry.tracer then entry.tracer:Destroy() end
+    if entry.highlight then entry.highlight:Destroy() end
+end
+Players.PlayerAdded:Connect(function(plr)
+    if state.espOn and plr ~= player then espEntries[plr] = makeEntry(plr) end
+end)
+Players.PlayerRemoving:Connect(function(plr)
+    if espEntries[plr] then destroyEntry(espEntries[plr]); espEntries[plr] = nil end
+end)
+local function tracerOrigin()
+    local v = Camera.ViewportSize; return Vector2.new(v.X / 2, v.Y)
+end
+RunService.RenderStepped:Connect(function()
+    if not state.espOn then
+        for _, e in pairs(espEntries) do
+            e.billboard.Enabled = false; e.tracer.Visible = false; e.highlight.Enabled = false
+        end
+        return
+    end
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= player and not espEntries[plr] then espEntries[plr] = makeEntry(plr) end
+    end
+    local origin = tracerOrigin()
+    for plr, entry in pairs(espEntries) do
+        local char = plr.Character
+        local head = char and char:FindFirstChild("Head")
+        local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+        local hum  = char and char:FindFirstChildOfClass("Humanoid")
+        if not (char and head and hrp and hum and hum.Health > 0) then
+            entry.billboard.Enabled = false; entry.tracer.Visible = false; entry.highlight.Enabled = false
+            continue
+        end
+        local role = classifyPlayer(plr)
+        local ri = ROLE[role] or ROLE.unknown
+        if not roleAllowed(role) then
+            entry.billboard.Enabled = false; entry.tracer.Visible = false; entry.highlight.Enabled = false
+            continue
+        end
+        local headPos, onScreen = Camera:WorldToViewportPoint(head.Position)
+        entry.billboard.Adornee = head; entry.billboard.Enabled = true
+        local parts = {}
+        if state.espName then table.insert(parts, plr.Name) end
+        if state.espRole then table.insert(parts, "[" .. ri.name .. "]") end
+        if state.espDistance then
+            local d = math.floor((hrp.Position - Camera.CFrame.Position).Magnitude)
+            table.insert(parts, "(" .. d .. "m)")
+        end
+        entry.label.Text = table.concat(parts, " "); entry.label.TextColor3 = ri.color
+        for _, e in ipairs(entry.edges) do e.BackgroundColor3 = ri.color; e.Visible = state.espBox end
+        entry.highlight.Adornee = char
+        entry.highlight.FillColor = ri.color; entry.highlight.OutlineColor = ri.color
+        entry.highlight.Enabled = state.espChams
+        if state.espTracer and onScreen then
+            local target = Vector2.new(headPos.X, headPos.Y)
+            local delta = target - origin; local len = delta.Magnitude
+            local mid = origin + delta / 2
+            entry.tracer.Visible = true
+            entry.tracer.Size = UDim2.new(0, len, 0, 1)
+            entry.tracer.Position = UDim2.new(0, mid.X, 0, mid.Y)
+            entry.tracer.AnchorPoint = Vector2.new(0.5, 0.5)
+            entry.tracer.Rotation = math.deg(math.atan2(delta.Y, delta.X))
+            entry.tracer.BackgroundColor3 = ri.color
+        else
+            entry.tracer.Visible = false
+        end
+    end
+end)
+local function clearAllESP()
+    for plr, e in pairs(espEntries) do destroyEntry(e) end
+    espEntries = {}
+end
+local function rebuildESP()
+    clearAllESP()
+    if state.espOn then
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= player then espEntries[plr] = makeEntry(plr) end
+        end
+    end
+end
+
+local gravGearBtnRef, dualGearBtnRef, speedGearBtnRef
+
+-- ============================================================
+-- UI
+-- ============================================================
+local ok, err = pcall(function()
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "CCHub"; gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true; gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    gui.DisplayOrder = 999; gui.Parent = playerGui
+
+    local miniBar = Instance.new("Frame")
+    miniBar.Size = UDim2.new(0, 220, 0, 34)
+    miniBar.Position = UDim2.new(0.5, -110, 0.5, -17)
+    miniBar.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
+    miniBar.BorderSizePixel = 0; miniBar.Active = true
+    miniBar.Parent = gui
+    local mbCorner = Instance.new("UICorner"); mbCorner.CornerRadius = UDim.new(0, 12); mbCorner.Parent = miniBar
+    local mbStroke = Instance.new("UIStroke"); mbStroke.Color = Color3.fromRGB(255, 200, 80); mbStroke.Thickness = 1.5; mbStroke.Transparency = 0.4; mbStroke.Parent = miniBar
+
+    local miniTitle = Instance.new("TextLabel")
+    miniTitle.Size = UDim2.new(1, -50, 1, 0); miniTitle.Position = UDim2.new(0, 12, 0, 0)
+    miniTitle.BackgroundTransparency = 1; miniTitle.Text = "★ CC HUB"
+    miniTitle.TextColor3 = Color3.fromRGB(255, 220, 120); miniTitle.Font = Enum.Font.GothamBold
+    miniTitle.TextSize = 14; miniTitle.TextXAlignment = Enum.TextXAlignment.Left
+    miniTitle.Parent = miniBar
+
+    local miniExpandBtn = Instance.new("TextButton")
+    miniExpandBtn.Size = UDim2.new(0, 28, 0, 24); miniExpandBtn.Position = UDim2.new(1, -34, 0.5, -12)
+    miniExpandBtn.BackgroundColor3 = Color3.fromRGB(90, 200, 110)
+    miniExpandBtn.TextColor3 = Color3.fromRGB(255, 255, 255); miniExpandBtn.Text = "+"
+    miniExpandBtn.Font = Enum.Font.GothamBold; miniExpandBtn.TextSize = 20
+    miniExpandBtn.Parent = miniBar
+    local mebCorner = Instance.new("UICorner"); mebCorner.CornerRadius = UDim.new(0, 6); mebCorner.Parent = miniExpandBtn
+
+    local function makeDraggable(obj)
+        local dragging, dragStart, startPos
+        obj.InputBegan:Connect(function(i)
+            if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+                dragging = true; dragStart = i.Position; startPos = obj.Position
+            end
+        end)
+        obj.InputEnded:Connect(function(i)
+            if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+                dragging = false
+            end
+        end)
+        UserInputService.InputChanged:Connect(function(i)
+            if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+                local d = i.Position - dragStart
+                obj.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+            end
+        end)
+    end
+    makeDraggable(miniBar)
+
+    local PANEL_W, PANEL_H = 240, 760
+    local panel = Instance.new("Frame")
+    panel.Size = UDim2.new(0, PANEL_W, 0, 0)
+    panel.Position = UDim2.new(0.5, -PANEL_W/2, 0.5, -PANEL_H/2)
+    panel.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
+    panel.BorderSizePixel = 0; panel.ClipsDescendants = true; panel.Visible = false; panel.Active = true
+    panel.Parent = gui
+    local pc = Instance.new("UICorner"); pc.CornerRadius = UDim.new(0, 12); pc.Parent = panel
+    local pstroke = Instance.new("UIStroke"); pstroke.Color = Color3.fromRGB(255, 200, 80); pstroke.Thickness = 1.5; pstroke.Transparency = 0.4; pstroke.Parent = panel
+    makeDraggable(panel)
+
+    local minimizeBtn = Instance.new("TextButton")
+    minimizeBtn.Size = UDim2.new(0, 22, 0, 22); minimizeBtn.Position = UDim2.new(1, -26, 0, 4)
+    minimizeBtn.BackgroundColor3 = Color3.fromRGB(55, 55, 68); minimizeBtn.TextColor3 = Color3.fromRGB(220, 220, 220)
+    minimizeBtn.Text = "−"; minimizeBtn.Font = Enum.Font.GothamBold; minimizeBtn.TextSize = 16
+    minimizeBtn.ZIndex = 5; minimizeBtn.Parent = panel
+    local minCorner = Instance.new("UICorner"); minCorner.CornerRadius = UDim.new(0, 6); minCorner.Parent = minimizeBtn
+
+    local scroll = Instance.new("ScrollingFrame")
+    scroll.Size = UDim2.new(1, -16, 1, -42); scroll.Position = UDim2.new(0, 8, 0, 34)
+    scroll.BackgroundTransparency = 1; scroll.BorderSizePixel = 0
+    scroll.ScrollBarThickness = 3; scroll.ScrollBarImageColor3 = Color3.fromRGB(255, 200, 80)
+    scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+    scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y; scroll.Parent = panel
+    local ll = Instance.new("UIListLayout"); ll.Padding = UDim.new(0, 5)
+    ll.SortOrder = Enum.SortOrder.LayoutOrder; ll.Parent = scroll
+
+    local function makeHeader(text, order)
+        local h = Instance.new("TextLabel")
+        h.Size = UDim2.new(1, -6, 0, 26); h.BackgroundTransparency = 1
+        h.Text = text; h.TextColor3 = Color3.fromRGB(255, 220, 120)
+        h.Font = Enum.Font.GothamBold; h.TextSize = 15
+        h.TextXAlignment = Enum.TextXAlignment.Left; h.LayoutOrder = order; h.Parent = scroll
+    end
+    local function makeSection(text, order)
+        local s = Instance.new("TextLabel")
+        s.Size = UDim2.new(1, -6, 0, 20); s.BackgroundTransparency = 1
+        s.Text = "— " .. text .. " —"; s.TextColor3 = Color3.fromRGB(160, 160, 170)
+        s.Font = Enum.Font.GothamMedium; s.TextSize = 11
+        s.TextXAlignment = Enum.TextXAlignment.Left; s.LayoutOrder = order; s.Parent = scroll
+    end
+    local function makeToggle(label, key, order, onChange)
+        local row = Instance.new("TextButton")
+        row.Size = UDim2.new(1, -6, 0, 34); row.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+        row.BorderSizePixel = 0; row.AutoButtonColor = false; row.Text = ""
+        row.LayoutOrder = order; row.Parent = scroll
+        local rc = Instance.new("UICorner"); rc.CornerRadius = UDim.new(0, 8); rc.Parent = row
+        local nl = Instance.new("TextLabel")
+        nl.Size = UDim2.new(1, -60, 1, 0); nl.Position = UDim2.new(0, 10, 0, 0)
+        nl.BackgroundTransparency = 1; nl.Text = label
+        nl.TextColor3 = Color3.fromRGB(230, 230, 230); nl.TextSize = 13
+        nl.Font = Enum.Font.GothamMedium; nl.TextXAlignment = Enum.TextXAlignment.Left; nl.Parent = row
+        local pill = Instance.new("Frame")
+        pill.Size = UDim2.new(0, 40, 0, 20); pill.Position = UDim2.new(1, -50, 0.5, -10)
+        pill.BackgroundColor3 = state[key] and Color3.fromRGB(90, 200, 110) or Color3.fromRGB(70, 70, 80)
+        pill.BorderSizePixel = 0; pill.Parent = row
+        local p2 = Instance.new("UICorner"); p2.CornerRadius = UDim.new(1, 0); p2.Parent = pill
+        local knob = Instance.new("Frame")
+        knob.Size = UDim2.new(0, 16, 0, 16)
+        knob.Position = state[key] and UDim2.new(1, -18, 0.5, -8) or UDim2.new(0, 2, 0.5, -8)
+        knob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        knob.BorderSizePixel = 0; knob.Parent = pill
+        local kc = Instance.new("UICorner"); kc.CornerRadius = UDim.new(1, 0); kc.Parent = knob
+        local function refresh()
+            TweenService:Create(pill, TweenInfo.new(0.15), {
+                BackgroundColor3 = state[key] and Color3.fromRGB(90, 200, 110) or Color3.fromRGB(70, 70, 80)
+            }):Play()
+            TweenService:Create(knob, TweenInfo.new(0.15), {
+                Position = state[key] and UDim2.new(1, -18, 0.5, -8) or UDim2.new(0, 2, 0.5, -8)
+            }):Play()
+        end
+        row.MouseButton1Click:Connect(function()
+            state[key] = not state[key]
+            refresh(); saveState()
+            if onChange then pcall(onChange, state[key]) end
+        end)
+        return row, refresh
+    end
+    local function makeActionButton(label, order, onClick)
+        local row = Instance.new("TextButton")
+        row.Size = UDim2.new(1, -6, 0, 30); row.BackgroundColor3 = Color3.fromRGB(55, 55, 68)
+        row.BorderSizePixel = 0; row.AutoButtonColor = false
+        row.Text = label; row.TextColor3 = Color3.fromRGB(220, 220, 220)
+        row.TextSize = 12; row.Font = Enum.Font.GothamMedium
+        row.LayoutOrder = order; row.Parent = scroll
+        local rc = Instance.new("UICorner"); rc.CornerRadius = UDim.new(0, 8); rc.Parent = row
+        row.MouseButton1Click:Connect(onClick)
+        return row
+    end
+
+    makeHeader("★ CC HUB", 1)
+    makeToggle("No Reload",      "noReload",    2, function(v) if v then startNoReload() else stopNoReload() end end)
+    makeToggle("Gun Draw Sound", "gunDraw",     3, function(v) if v then startGunDraw()  else stopGunDraw()  end end)
+    makeToggle("Gun Rotation",   "gunRotation", 4, function(v) if v then startWeaponRotator() else stopWeaponRotator() end end)
+    makeToggle("Old Animation",  "oldAnim",     5, function(v) if v then startOldAnim()  else stopOldAnim()  end end)
+    makeToggle("Old Throw",      "oldThrow",    6, function(v) if v then startOldThrow() else stopOldThrow() end end)
+    makeToggle("Anti Fling",     "antiFling",   7, function(v) if v then startAntiFling() else stopAntiFling() end end)
+    makeToggle("Shift Lock",     "shiftLock",   8, function(v)
+        if not v and activeHum then activeHum.CameraOffset = NORMAL_OFFSET; isShiftLocked = false end
+    end)
+    makeToggle("Gear Hub",       "gearHub",     9, function(v)
+        if not v and activeHum then
+            activeHum.WalkSpeed = 16
+            if SLOTS.single.rig.force then SLOTS.single.rig.force.Enabled = false end
+            if SLOTS.dual.rig.force then SLOTS.dual.rig.force.Enabled = false end
+        end
+    end)
+
+    makeSection("gravity coil", 10)
+    local gravGearBtn = makeActionButton(
+        chosenGravity and ("Gravity: " .. chosenGravity) or "Set Gravity Gear", 11,
+        function() captureMode = "gravity"; gravGearBtn.Text = "Equip gravity coil now..." end
+    )
+    gravGearBtnRef = gravGearBtn
+    makeToggle("Gravity Active", "gravActive", 12, function(v)
+        if v and not chosenGravity then state.gravActive = false; if refreshUI then refreshUI() end end
+    end)
+
+    makeSection("dual gravity coil", 13)
+    local dualGearBtn = makeActionButton(
+        chosenDualGravity and ("Dual: " .. chosenDualGravity) or "Set Dual Gravity Gear", 14,
+        function() captureMode = "dualGravity"; dualGearBtn.Text = "Equip dual coil now..." end
+    )
+    dualGearBtnRef = dualGearBtn
+    makeToggle("Dual Grav Active", "dualGravActive", 15, function(v)
+        if v and not chosenDualGravity then state.dualGravActive = false; if refreshUI then refreshUI() end end
+    end)
+    local p1 = makeActionButton("", 16, function()
+        applyDualPreset(1); p1.BackgroundColor3 = Color3.fromRGB(90, 200, 110)
+        p2.BackgroundColor3 = Color3.fromRGB(55, 55, 68)
+    end)
+    local p2 = makeActionButton("", 17, function()
+        applyDualPreset(2); p1.BackgroundColor3 = Color3.fromRGB(55, 55, 68)
+        p2.BackgroundColor3 = Color3.fromRGB(90, 200, 110)
+    end)
+    p1.Text = DUAL_PRESETS[1].label .. "  (" .. DUAL_PRESETS[1].negation .. "/" .. DUAL_PRESETS[1].kick .. ")"
+    p2.Text = DUAL_PRESETS[2].label .. "  (" .. DUAL_PRESETS[2].negation .. "/" .. DUAL_PRESETS[2].kick .. ")"
+    if state.dualPreset == 1 then p1.BackgroundColor3 = Color3.fromRGB(90, 200, 110)
+    else p2.BackgroundColor3 = Color3.fromRGB(90, 200, 110) end
+
+    makeSection("speed coil", 18)
+    local speedGearBtn = makeActionButton(
+        chosenSpeed and ("Speed: " .. chosenSpeed) or "Set Speed Gear", 19,
+        function() captureMode = "speed"; speedGearBtn.Text = "Equip speed coil now..." end
+    )
+    speedGearBtnRef = speedGearBtn
+    makeToggle("Speed Active", "speedActive", 20, function(v)
+        if v and not chosenSpeed then state.speedActive = false; if refreshUI then refreshUI() end end
+    end)
+
+    refreshUI = function()
+        gravGearBtn.Text = chosenGravity and ("Gravity: " .. chosenGravity) or "Set Gravity Gear"
+        dualGearBtn.Text = chosenDualGravity and ("Dual: " .. chosenDualGravity) or "Set Dual Gravity Gear"
+        speedGearBtn.Text = chosenSpeed and ("Speed: " .. chosenSpeed) or "Set Speed Gear"
+    end
+
+    makeSection("roles esp", 21)
+    makeToggle("ESP Master", "espOn", 22, function(v) if v then rebuildESP() else clearAllESP() end end)
+    makeToggle("3D Box", "espBox", 23, nil)
+    makeToggle("Name", "espName", 24, nil)
+    makeToggle("Role Tag", "espRole", 25, nil)
+    makeToggle("Distance", "espDistance", 26, nil)
+    makeToggle("Tracer", "espTracer", 27, nil)
+    makeToggle("Chams", "espChams", 28, nil)
+    makeSection("role filter", 29)
+    makeToggle("Show Murderer", "espShowMurderer", 30, nil)
+    makeToggle("Show Sheriff",  "espShowSheriff",  31, nil)
+    makeToggle("Show Innocent", "espShowInnocent", 32, nil)
+
+    miniExpandBtn.MouseButton1Click:Connect(function()
+        miniBar.Visible = false
+        panel.Position = miniBar.Position
+        panel.Visible = true
+        panel.Size = UDim2.new(0, PANEL_W, 0, 0)
+        TweenService:Create(panel, TweenInfo.new(0.18, Enum.EasingStyle.Quad), {
+            Size = UDim2.new(0, PANEL_W, 0, PANEL_H)
+        }):Play()
+    end)
+    minimizeBtn.MouseButton1Click:Connect(function()
+        local t = TweenService:Create(panel, TweenInfo.new(0.18, Enum.EasingStyle.Quad), {
+            Size = UDim2.new(0, PANEL_W, 0, 0)
+        })
+        t.Completed:Connect(function()
+            panel.Visible = false
+            miniBar.Position = panel.Position
+            miniBar.Visible = true
+        end)
+        t:Play()
+    end)
+end)
+if not ok then warn("[CCHub] build failed: " .. tostring(err)) end
+
+if activeChar then setupWatchers(activeChar); task.defer(setupRigs) end
+if state.noReload    then startNoReload()      end
+if state.gunDraw     then startGunDraw()       end
+if state.gunRotation then startWeaponRotator() end
+if state.oldAnim     then startOldAnim()       end
+if state.oldThrow    then startOldThrow()      end
+if state.antiFling   then startAntiFling()     end
+if state.espOn       then rebuildESP()         end
